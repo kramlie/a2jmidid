@@ -64,7 +64,7 @@ int portid;
 int queue_id;
 
 
-int init_alsa(const char * client_name);
+int init_alsa(const char * client_name, jack_nframes_t sample_rate);
 int init_jack(const char * client_name);
 void sigint_handler(int i);
 int jack_callback(jack_nframes_t nframes, void *arg);
@@ -76,6 +76,7 @@ int main(int argc, char **argv) {
   unsigned long old_ringbuffer_overflows = 0;
   struct timespec sleep_time = { 0, 1e6 };
   const char * client_name;
+  int anything_sent;
 
   if (argc == 2)
   {
@@ -87,7 +88,9 @@ int main(int argc, char **argv) {
   }
   
   /* Initialise connections and signal handlers */
-  if (!(init_alsa(client_name) && init_jack(client_name)))
+  if (!init_jack(client_name))
+    exit(1);
+  if (!init_alsa(client_name, jack_get_sample_rate(jack_client)))
     exit(1);
   signal(SIGINT, &sigint_handler);
   signal(SIGTERM, &sigint_handler);
@@ -102,24 +105,30 @@ int main(int argc, char **argv) {
     }
     
     /* Write MIDI events to the ALSA sequencer port */
+    anything_sent = 0;
     while (jack_ringbuffer_read_space(jack_ringbuffer) >= sizeof(size_t) && 
 	   keep_running) {
       output_event();
+      anything_sent = 1;
     }
-    
+    if (anything_sent)
+      snd_seq_drain_output(seq_handle);
     nanosleep(&sleep_time, NULL);
   }
   
   /* Clean up */
+  snd_seq_close(seq_handle);
   jack_client_close(jack_client);
   jack_ringbuffer_free(jack_ringbuffer);
-  snd_seq_close(seq_handle);
   
   return 0;
 }
 
 
-int init_alsa(const char * client_name) {
+int init_alsa(const char * client_name, jack_nframes_t sample_rate) {
+  snd_seq_queue_tempo_t *queue_tempo;
+  unsigned int tempo;
+  int ppq;
   
   /* Get a sequencer handle */
   if (snd_seq_open(&seq_handle, "hw", SND_SEQ_OPEN_OUTPUT, 0) < 0) {
@@ -140,6 +149,14 @@ int init_alsa(const char * client_name) {
   /* Initialise miscellaneous other stuff */
   queue_id = snd_seq_alloc_queue(seq_handle);
   snd_midi_event_new(1024, &alsa_encoder);
+  snd_seq_queue_tempo_malloc(&queue_tempo);
+  snd_seq_get_queue_tempo(seq_handle, queue_id, queue_tempo);
+  tempo = snd_seq_queue_tempo_get_tempo(queue_tempo);
+  /* Set ppq so that one Jack frame corresponds to one ALSA tick */
+  ppq = (double)tempo * (double)sample_rate / 1000000.0;
+  snd_seq_queue_tempo_set_ppq(queue_tempo, ppq);
+  snd_seq_set_queue_tempo(seq_handle, queue_id, queue_tempo);
+  snd_seq_queue_tempo_free(queue_tempo);
   snd_seq_start_queue(seq_handle, queue_id, NULL); 
   
   return 1;
@@ -215,6 +232,9 @@ int jack_callback(jack_nframes_t nframes, void *arg) {
 			    (char*)&jack_midi_event.size, 
 			    sizeof(size_t));
       jack_ringbuffer_write(jack_ringbuffer, 
+			    (char*)&jack_midi_event.time, 
+			    sizeof(jack_nframes_t));
+      jack_ringbuffer_write(jack_ringbuffer, 
 			    (char*)jack_midi_event.buffer,
 			    jack_midi_event.size);
     }
@@ -226,16 +246,21 @@ int jack_callback(jack_nframes_t nframes, void *arg) {
 	
 void output_event() {
   size_t event_size;
+  size_t total_size;
   static char event_buffer[1024];
   snd_seq_event_t alsa_event;
   static struct timespec sleep_time = { 0, 1e4 };
+  jack_nframes_t frames;
   
   /* Read the size of the MIDI data and wait until we have that much
      data to read on the ringbuffer */
   jack_ringbuffer_read(jack_ringbuffer, (char*)&event_size, sizeof(size_t));
-  while (jack_ringbuffer_read_space(jack_ringbuffer) < event_size &&
+  total_size = sizeof(jack_nframes_t) + event_size;
+  while (jack_ringbuffer_read_space(jack_ringbuffer) < total_size &&
 	 keep_running)
     nanosleep(&sleep_time, NULL);
+
+  jack_ringbuffer_read(jack_ringbuffer, (char*)&frames, sizeof(jack_nframes_t));
   
   /* Read the MIDI data and make an ALSA MIDI event from it */
   jack_ringbuffer_read(jack_ringbuffer, event_buffer, event_size);
@@ -244,7 +269,7 @@ void output_event() {
 			    event_size, &alsa_event)) {
     snd_seq_ev_set_source(&alsa_event, portid);
     snd_seq_ev_set_subs(&alsa_event);
-    snd_seq_ev_schedule_tick(&alsa_event, queue_id, 1, 0);
-    snd_seq_event_output_direct(seq_handle, &alsa_event);
+    snd_seq_ev_schedule_tick(&alsa_event, queue_id, 1, frames);
+    snd_seq_event_output(seq_handle, &alsa_event);
   }
 }

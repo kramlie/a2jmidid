@@ -55,16 +55,20 @@ void
 midi_action(snd_seq_t *seq_handle)
 {
     snd_seq_event_t *ev;
-    static unsigned char buffer[16];
+    static unsigned char buffer[1 + sizeof(jack_nframes_t) + 16];
+    jack_nframes_t event_time;
     long count;
 
     do {
         snd_seq_event_input(seq_handle, &ev);
 
-        count = snd_midi_event_decode(alsa_decoder, buffer + 1, 16, ev);
+        event_time = jack_frame_time(jack_client);
+
+        count = snd_midi_event_decode(alsa_decoder, buffer + 1 + sizeof(jack_nframes_t), 16, ev);
         if (count > 0 && count < 16) {
             buffer[0] = (unsigned char)count;
-            count++;
+            memcpy(buffer + 1, &event_time, sizeof(jack_nframes_t));
+            count += 1 + sizeof(jack_nframes_t);
             if (jack_ringbuffer_write(jack_ringbuffer, (char *)buffer, count) != count) {
                 fprintf(stderr, "ringbuffer overflow!\n");
             }
@@ -77,10 +81,22 @@ midi_action(snd_seq_t *seq_handle)
 int
 jack_callback(jack_nframes_t nframes, void *arg)
 {
-    static unsigned char buffer[16];
+    static unsigned char buffer[1 + sizeof(jack_nframes_t) + 16];
+    static jack_nframes_t last_cycle_start = 0;
+    jack_nframes_t cycle_start;
+    jack_nframes_t cycle_duration;
+    jack_nframes_t event_time;
+    jack_nframes_t event_offset;
+    jack_nframes_t frame_offset;
     size_t count;
+    size_t total_size;
     unsigned char *p;
     void* port_buf = jack_port_get_buffer(jack_midi_port, nframes);
+
+    cycle_start = jack_last_frame_time(jack_client);
+
+    /* the first call has no previous cycle to measure against */
+    cycle_duration = (last_cycle_start != 0) ? (cycle_start - last_cycle_start) : 0;
 
     jack_midi_clear_buffer(port_buf);
 
@@ -88,19 +104,43 @@ jack_callback(jack_nframes_t nframes, void *arg)
         count  = jack_ringbuffer_peek(jack_ringbuffer, (char*)buffer, 1);
         if (count) {
             count = (size_t)buffer[0];
-            if (jack_ringbuffer_read(jack_ringbuffer, (char*)buffer, count + 1) != count + 1) {
+            total_size = 1 + sizeof(jack_nframes_t) + count;
+            if (jack_ringbuffer_read(jack_ringbuffer, (char*)buffer, total_size) != total_size) {
                 fprintf(stderr, "???? short read from ringbuffer!\n"); /* shouldn't happen */
             } else {
-	      /* -FIX- this should have the frame time of the event, instead of '0': */
-	        p = jack_midi_event_reserve(port_buf, 0, count);
+                memcpy(&event_time, buffer + 1, sizeof(jack_nframes_t));
+
+                /* Events were timestamped (in midi_action()) against the
+                 * frame time some time after the previous cycle started and
+                 * before this one did; place each event in this cycle's
+                 * buffer according to where its timestamp falls within that
+                 * [last_cycle_start, cycle_start) span */
+                if (cycle_duration <= 0) {
+                    frame_offset = 0;
+                } else {
+                    if (event_time < last_cycle_start) {
+                        frame_offset = 0;
+                    } else {
+                        event_offset = event_time - last_cycle_start;
+                        if (event_offset >= cycle_duration) {
+                            frame_offset = nframes - 1;
+                        } else {
+                            frame_offset = (jack_nframes_t)(event_offset * nframes / cycle_duration);
+                        }
+                    }
+                }
+
+                p = jack_midi_event_reserve(port_buf, frame_offset, count);
                 if (p) {
-                    memcpy(p, buffer + 1, count);
+                    memcpy(p, buffer + 1 + sizeof(jack_nframes_t), count);
                     events_copied++;
                 } else
                     jack_write_overflows++;
             }
         }
     }
+
+    last_cycle_start = cycle_start;
 
     return 0;
 }
